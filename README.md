@@ -11,6 +11,7 @@ The HTML export renders every page to SVG and packs the deck into **one self-con
 - **Faithful:** scenes are rendered by Typst. The player only animates labelled groups, using the same model and easing tables as the PDF output.
 - **Smooth trackers and morphs:** value trackers with `interpolate: true` are blended between Typst-rendered samples wherever their SVG structure matches. `transform-matching` morphs equations glyph by glyph, with a crossfade where an overlay could not look right.
 - **Presenter keys:** arrow keys, space or click to go forward; a click during an animation finishes it. <kbd>R</kbd> replays the step, <kbd>N</kbd> shows the speaker notes, <kbd>F</kbd> toggles fullscreen.
+- **3D scenes:** the player projects and depth-sorts touying's 3D geometry on every frame: smooth camera moves, rotations and deforming surfaces. Drag a 3D scene to look around, use the wheel to zoom, and press <kbd>0</kbd> to return to the scripted view.
 - **Presenter window:** <kbd>P</kbd> (or <kbd>S</kbd>) opens a second window that shows the current page live, the next page, the speaker notes and a timer (<kbd>T</kbd> pauses it). Both windows navigate the deck. Animations run on a single clock and keep playing while either window is visible.
 
 `--html-engine impress` selects the previous impress.js export. `--no-compress` embeds the deck as plain JSON for debugging or for very old browsers.
