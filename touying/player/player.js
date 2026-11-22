@@ -95,6 +95,34 @@
 
   // ------------------------------------------------------------ scene view
 
+  // Which knot(s) of a tracked object to show at segment time t:
+  // {k} or {k, k1, f} to blend (see touying's `_spans`).
+  function knotSelect(K, t, duration, rates, blendable) {
+    if (t >= duration - 1e-9 || K.spans.length === 0) return { k: K.end };
+    let span = K.spans[K.spans.length - 1];
+    for (const sp of K.spans) {
+      if (t < sp.b - 1e-9) {
+        span = sp;
+        break;
+      }
+    }
+    const pts = span.knots;
+    if (span.kind === "hold" || pts.length === 1) return { k: pts[0][1] };
+    const p =
+      span.kind === "progress"
+        ? easeEval(rates[span.ease], (t - span.a) / (span.b - span.a))
+        : t;
+    let i = 0;
+    while (i < pts.length - 1 && pts[i + 1][0] <= p + 1e-12) i++;
+    const [p0, k0] = pts[i];
+    if (i >= pts.length - 1 || !K.interpolate) return { k: k0 };
+    const [p1, k1] = pts[i + 1];
+    const f = clamp((p - p0) / (p1 - p0), 0, 1);
+    if (f <= 1e-9) return { k: k0 };
+    if (!blendable(k0, k1)) return { k: k0 };
+    return { k: k0, k1, f };
+  }
+
   let clipIds = 0;
 
   function byLabel(root, label) {
@@ -193,30 +221,8 @@
     // Which knot(s) to show at segment time t: {k} or {k, k1, f} to blend.
     knotAt(t, duration, rates) {
       const K = this.rec.knots;
-      if (t >= duration - 1e-9 || K.spans.length === 0) return { k: K.end };
-      let span = K.spans[K.spans.length - 1];
-      for (const sp of K.spans) {
-        if (t < sp.b - 1e-9) {
-          span = sp;
-          break;
-        }
-      }
-      const pts = span.knots;
-      if (span.kind === "hold" || pts.length === 1) return { k: pts[0][1] };
-      const p =
-        span.kind === "progress"
-          ? easeEval(rates[span.ease], (t - span.a) / (span.b - span.a))
-          : t;
-      let i = 0;
-      while (i < pts.length - 1 && pts[i + 1][0] <= p + 1e-12) i++;
-      const [p0, k0] = pts[i];
-      if (i >= pts.length - 1 || !K.interpolate) return { k: k0 };
-      const [p1, k1] = pts[i + 1];
-      const f = clamp((p - p0) / (p1 - p0), 0, 1);
-      if (f <= 1e-9) return { k: k0 };
       // Only knots with the same skeleton can be blended number by number.
-      if (K.knots[k0].s !== K.knots[k1].s) return { k: k0 };
-      return { k: k0, k1, f };
+      return knotSelect(K, t, duration, rates, (a, b) => K.knots[a].s === K.knots[b].s);
     }
 
     applyKnots(t, duration, rates) {
@@ -367,6 +373,7 @@
         if (el) this.objects.push(new ObjectView(el, o));
       }
       this.morphs = (rec.morphs || []).map((m) => new MorphView(this, m));
+      this.world = rec.camera ? new World3D(this) : null;
     }
 
     object(id) {
@@ -387,6 +394,7 @@
       // Morphs measure both objects at their end points first.
       for (const m of this.morphs) if (!m.ready) m.setup();
       this.applyObjects(tt);
+      if (this.world) this.world.apply(tt);
       for (const m of this.morphs) m.apply(tt);
     }
 
@@ -398,6 +406,421 @@
     }
   }
 
+
+  // -------------------------------------------------------------------- 3D
+
+  // Mirrors touying's src/core/scene3d.typ (the specification is there):
+  // camera basis, near-plane clipping before projection, open-path
+  // triangles, shading on sRGB channels and painter's-algorithm sorting.
+  const NEAR = 0.05;
+  const TINY = 1e-9;
+  const add3 = (a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]];
+  const sub3 = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+  const mul3 = (a, k) => [a[0] * k, a[1] * k, a[2] * k];
+  const dot3 = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+  const cross3 = (a, b) => [
+    a[1] * b[2] - a[2] * b[1],
+    a[2] * b[0] - a[0] * b[2],
+    a[0] * b[1] - a[1] * b[0],
+  ];
+  const len3 = (a) => Math.sqrt(dot3(a, a));
+  const DEG = Math.PI / 180;
+  const MAT_ID = [1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0];
+
+  function matMul(a, b) {
+    const out = [];
+    for (let i = 0; i < 3; i++)
+      for (let j = 0; j < 4; j++) {
+        let v = a[i * 4] * b[j] + a[i * 4 + 1] * b[4 + j] + a[i * 4 + 2] * b[8 + j];
+        if (j === 3) v += a[i * 4 + 3];
+        out.push(v);
+      }
+    return out;
+  }
+
+  const matApply = (m, p) => [
+    m[0] * p[0] + m[1] * p[1] + m[2] * p[2] + m[3],
+    m[4] * p[0] + m[5] * p[1] + m[6] * p[2] + m[7],
+    m[8] * p[0] + m[9] * p[1] + m[10] * p[2] + m[11],
+  ];
+
+  function matRotation(axis, deg, pivot) {
+    const n = mul3(axis, 1 / len3(axis));
+    const [x, y, z] = n;
+    const c = Math.cos(deg * DEG), s = Math.sin(deg * DEG), k = 1 - c;
+    const r = [
+      [c + x * x * k, x * y * k - z * s, x * z * k + y * s],
+      [y * x * k + z * s, c + y * y * k, y * z * k - x * s],
+      [z * x * k - y * s, z * y * k + x * s, c + z * z * k],
+    ];
+    const t = sub3(pivot, r.map((row) => dot3(row, pivot)));
+    return [...r[0], t[0], ...r[1], t[1], ...r[2], t[2]];
+  }
+
+  function stepsMatrix(steps, state) {
+    let m = MAT_ID;
+    steps.forEach((st, k) => {
+      const e = state["step:" + k] || 0;
+      if (Math.abs(e) < TINY) return;
+      const s =
+        st.kind === "rot"
+          ? matRotation(st.axis, st.angle * e, st.pivot)
+          : [1, 0, 0, st.vec[0] * e, 0, 1, 0, st.vec[1] * e, 0, 0, 1, st.vec[2] * e];
+      m = matMul(s, m);
+    });
+    return m;
+  }
+
+  function makeView(v, unit, at) {
+    const p = v.phi * DEG, t = v.theta * DEG;
+    return {
+      c: [Math.sin(p) * Math.cos(t), Math.sin(p) * Math.sin(t), Math.cos(p)],
+      right: [-Math.sin(t), Math.cos(t), 0],
+      up: [-Math.cos(p) * Math.cos(t), -Math.cos(p) * Math.sin(t), Math.sin(p)],
+      center: [v.cx, v.cy, v.cz],
+      ifocal: v.ifocal,
+      scale: v.zoom * unit,
+      at,
+    };
+  }
+
+  function toCamera(view, p) {
+    const q = sub3(p, view.center);
+    const d = dot3(q, view.c);
+    return [dot3(q, view.right), dot3(q, view.up), d, 1 - d * view.ifocal];
+  }
+
+  const toScreen = (view, c) => [
+    view.at[0] + (c[0] / c[3]) * view.scale,
+    view.at[1] - (c[1] / c[3]) * view.scale,
+  ];
+
+  const hexRgb = (hex) => [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+  const rgbHex = (ch) =>
+    "#" + ch.map((x) => clamp(x, 0, 255).toString(16).padStart(2, "0")).join("");
+
+  function shadeHex(hex, tri, view) {
+    const [a, b, c] = tri;
+    const n = cross3(sub3(b, a), sub3(c, a));
+    const l = len3(n);
+    if (l < TINY) return hex;
+    const k = 0.35 + 0.65 * Math.abs(dot3(mul3(n, 1 / l), view.c));
+    return rgbHex(hexRgb(hex).map((x) => Math.round(x * k)));
+  }
+
+  const cutAt = (p, q) => {
+    const t = (NEAR - p[3]) / (q[3] - p[3]);
+    return [0, 1, 2, 3].map((k) => p[k] + (q[k] - p[k]) * t);
+  };
+
+  // Clip against w >= NEAR; flags[i] = stroked edge ending at point i.
+  function clipPolygon(pts, flags) {
+    const out = [], outFlags = [];
+    const n = pts.length;
+    for (let i = 0; i < n; i++) {
+      const p = pts[(i + n - 1) % n], q = pts[i], f = flags[i];
+      const pin = p[3] >= NEAR - TINY, qin = q[3] >= NEAR - TINY;
+      if (pin && qin) {
+        out.push(q);
+        outFlags.push(f);
+      } else if (pin && !qin) {
+        out.push(cutAt(p, q));
+        outFlags.push(f);
+      } else if (!pin && qin) {
+        out.push(cutAt(p, q));
+        outFlags.push(false);
+        out.push(q);
+        outFlags.push(f);
+      }
+    }
+    const pts2 = [], flags2 = [];
+    out.forEach((p, i) => {
+      if (pts2.length && len3(sub3(p, pts2[pts2.length - 1])) < TINY) {
+        flags2[flags2.length - 1] = flags2[flags2.length - 1] || outFlags[i];
+        return;
+      }
+      pts2.push(p);
+      flags2.push(outFlags[i]);
+    });
+    if (pts2.length > 1 && len3(sub3(pts2[0], pts2[pts2.length - 1])) < TINY) {
+      pts2.pop();
+      const last = flags2.pop();
+      flags2[0] = flags2[0] || last;
+    }
+    return [pts2, flags2];
+  }
+
+  function area2(pts) {
+    let s = 0;
+    for (let i = 0; i < pts.length; i++) {
+      const a = pts[i], b = pts[(i + 1) % pts.length];
+      s += a[0] * b[1] - b[0] * a[1];
+    }
+    return Math.abs(s) / 2;
+  }
+
+  function compareKeys(x, y) {
+    for (let i = 0; i < 4; i++) if (x.key[i] !== y.key[i]) return x.key[i] - y.key[i];
+    return 0;
+  }
+
+  // items: [{geom, pos, matrix, opacity, draw}] in declaration order.
+  function drawables(view, items) {
+    const list = [];
+    items.forEach((item, oi) => {
+      const { geom, pos, matrix, opacity, draw } = item;
+      if (opacity <= TINY) return;
+      const world = [];
+      for (let i = 0; i < pos.length; i += 3) world.push(matApply(matrix, [pos[i], pos[i + 1], pos[i + 2]]));
+      const cam = world.map((p) => toCamera(view, p));
+      const partial = clamp(draw, 0, 1);
+      geom.prims.forEach((pr, pi) => {
+        const kind = pr[0];
+        if (kind === "t") {
+          const [, a, b, c, mi, mask] = pr;
+          const m = geom.mats[mi];
+          const fill = m.f !== null && m.shade ? shadeHex(m.f, [world[a], world[b], world[c]], view) : m.f;
+          const flags = [((mask >> 2) & 1) === 1, (mask & 1) === 1, ((mask >> 1) & 1) === 1];
+          const tri = [cam[a], cam[b], cam[c]];
+          let pts = tri, fl = flags;
+          if (!tri.every((q) => q[3] >= NEAR)) [pts, fl] = clipPolygon(tri, flags);
+          if (pts.length < 3) return;
+          const screen = pts.map((q) => toScreen(view, q));
+          if (area2(screen) < 1e-12) return;
+          list.push({
+            key: [pts.reduce((s, q) => s + q[2], 0) / pts.length, oi, pi, 0],
+            kind: "poly", pts: screen, flags: fl,
+            fill, fa: m.fa * opacity * partial, stroke: m.s, sa: m.sa * opacity * partial, sw: m.sw,
+          });
+        } else if (kind === "s") {
+          const [, a, b, mi, s0, s1] = pr;
+          if (partial <= s0 + TINY) return;
+          const m = geom.mats[mi];
+          const pb = partial < s1
+            ? toCamera(view, add3(world[a], mul3(sub3(world[b], world[a]), (partial - s0) / (s1 - s0))))
+            : cam[b];
+          const pa = cam[a];
+          const ain = pa[3] >= NEAR, bin = pb[3] >= NEAR;
+          if (!ain && !bin) return;
+          const [p, q] = ain && bin ? [pa, pb] : ain ? [pa, cutAt(pa, pb)] : [cutAt(pa, pb), pb];
+          const sp = toScreen(view, p), sq = toScreen(view, q);
+          if (Math.hypot(sp[0] - sq[0], sp[1] - sq[1]) < 1e-9) return;
+          list.push({
+            key: [(p[2] + q[2]) / 2, oi, pi, 0],
+            kind: "line", pts: [sp, sq], stroke: m.s, sa: m.sa * opacity, sw: m.sw,
+          });
+        } else if (kind === "h") {
+          const [, tip, base, mi] = pr;
+          if (partial < 1 - 1e-6) return;
+          const t = cam[tip], b = cam[base];
+          if (t[3] < NEAR || b[3] < NEAR) return;
+          const st = toScreen(view, t), sb = toScreen(view, b);
+          const dx = st[0] - sb[0], dy = st[1] - sb[1];
+          const l = Math.hypot(dx, dy);
+          if (l < 1e-9) return;
+          const m = geom.mats[mi];
+          const ux = dx / l, uy = dy / l, h = m.h;
+          const back = [st[0] - ux * h, st[1] - uy * h];
+          list.push({
+            key: [t[2], oi, pi, 0],
+            kind: "poly",
+            pts: [st, [back[0] - uy * h * 0.4, back[1] + ux * h * 0.4], [back[0] + uy * h * 0.4, back[1] - ux * h * 0.4]],
+            flags: [false, false, false],
+            fill: m.s, fa: m.sa * opacity, stroke: null, sa: 0, sw: 0,
+          });
+        } else if (kind === "p") {
+          const [, a, mi] = pr;
+          const q = cam[a];
+          if (q[3] < NEAR) return;
+          const m = geom.mats[mi];
+          list.push({ key: [q[2], oi, pi, 0], kind: "point", at: toScreen(view, q), r: m.r, fill: m.f, fa: m.fa * opacity * partial });
+        } else if (kind === "l") {
+          const [, a, li] = pr;
+          const q = cam[a];
+          if (q[3] < NEAR) return;
+          list.push({
+            key: [q[2], oi, pi, 0], kind: "label", at: toScreen(view, q),
+            obj: oi, label: li, alpha: opacity * partial, depth: geom.labels[li].depth,
+          });
+        }
+      });
+    });
+    return list.sort(compareKeys);
+  }
+
+  const fmt = (x) => String(+x.toFixed(3));
+  const pathOf = (pts, close) =>
+    "M" + pts.map((p) => fmt(p[0]) + " " + fmt(p[1])).join("L") + (close ? "Z" : "");
+
+  // Path specifications (d, fill, stroke) of one drawable; mirrors draw-one.
+  function pathSpecs(d) {
+    const fill = d.fill ? [d.fill, d.fa] : null;
+    const stroke = d.stroke && d.sw > 0 ? [d.stroke, d.sa, d.sw] : null;
+    if (d.kind === "poly") {
+      const n = d.pts.length;
+      const off = d.flags.filter((f) => !f).length;
+      if (!stroke || off === 0) return [{ d: pathOf(d.pts, true), fill, stroke }];
+      if (off === 1 && n === 3) {
+        const i = d.flags.indexOf(false);
+        const order = [0, 1, 2].map((k) => d.pts[(i + k) % n]);
+        return [{ d: pathOf(order, false), fill, stroke }];
+      }
+      const out = [{ d: pathOf(d.pts, true), fill, stroke: null }];
+      let edges = "";
+      for (let i = 0; i < n; i++) if (d.flags[i]) edges += pathOf([d.pts[(i + n - 1) % n], d.pts[i]], false);
+      if (edges) out.push({ d: edges, fill: null, stroke });
+      return out;
+    }
+    if (d.kind === "line") return stroke ? [{ d: pathOf(d.pts, false), fill: null, stroke }] : [];
+    if (d.kind === "point") {
+      if (!fill || d.r <= 0) return [];
+      const [x, y] = d.at, r = d.r;
+      return [{
+        d: `M${fmt(x - r)} ${fmt(y)}a${fmt(r)} ${fmt(r)} 0 1 0 ${fmt(2 * r)} 0a${fmt(r)} ${fmt(r)} 0 1 0 ${fmt(-2 * r)} 0Z`,
+        fill, stroke: null,
+      }];
+    }
+    return [];
+  }
+
+  // Drag offsets per scene key, shared by every stage (audience, presenter).
+  const DRAG = new Map();
+
+  // The 3D layer of one scene on one stage.
+  class World3D {
+    constructor(scene) {
+      this.scene = scene;
+      const rec = scene.rec;
+      this.rec = rec;
+      const anchor = byLabel(scene.root, rec.world.label);
+      const doc = scene.root.ownerDocument;
+      this.doc = doc;
+      this.group = doc.createElementNS(SVGNS, "g");
+      this.group.setAttribute("data-tys-world", rec.scene.key);
+      (anchor || scene.root).appendChild(this.group);
+      this.pool = [];
+      this.objects = rec.objects.filter((o) => o.geom);
+      // Label billboards: Typst-rendered groups, positioned by the player.
+      this.labels = this.objects.map((o) =>
+        o.geom.labels.map((l) => {
+          const el = byLabel(scene.root, l.label);
+          if (!el) return null;
+          const wrap = doc.createElementNS(SVGNS, "g");
+          while (el.firstChild) wrap.appendChild(el.firstChild);
+          el.appendChild(wrap);
+          return { el, wrap, spec: l };
+        })
+      );
+      this.time = 0;
+    }
+
+    camera(t) {
+      const cam = this.rec.camera;
+      const v = evalObject(cam, this.rec.rates, t);
+      const off = DRAG.get(this.rec.scene.key);
+      if (off) {
+        v.phi += off.dphi;
+        v.theta += off.dtheta;
+        v.zoom *= off.zoom;
+      }
+      return makeView(v, cam.unit, cam.at);
+    }
+
+    positions(o, t) {
+      const K = o.knots;
+      if (!K || K.kind !== "geom") return o.geom.pos;
+      const sel = knotSelect(K, t, this.rec.duration, this.rec.rates, () => true);
+      const a = K.positions[sel.k];
+      if (sel.k1 === undefined) return a;
+      const b = K.positions[sel.k1];
+      return a.map((x, i) => x + (b[i] - x) * sel.f);
+    }
+
+    apply(t) {
+      this.time = t;
+      const rates = this.rec.rates;
+      const view = this.camera(t);
+      const items = this.objects.map((o) => {
+        const s = evalObject(o, rates, t);
+        return {
+          geom: o.geom,
+          pos: this.positions(o, t),
+          matrix: stepsMatrix(o.geom.steps, s),
+          opacity: clamp(s.opacity, 0, 1),
+          draw: s.draw,
+        };
+      });
+      const list = drawables(view, items);
+      this.render(list);
+      this.lastList = list;
+      this.lastItems = items;
+    }
+
+    redraw() {
+      this.apply(this.time);
+    }
+
+    node(i) {
+      let p = this.pool[i];
+      if (!p) {
+        p = this.doc.createElementNS(SVGNS, "path");
+        p.setAttribute("stroke-linecap", "butt");
+        p.setAttribute("stroke-linejoin", "miter");
+        p.setAttribute("stroke-miterlimit", "4");
+        this.pool[i] = p;
+      }
+      return p;
+    }
+
+    render(list) {
+      const order = [];
+      let n = 0;
+      const shown = new Set();
+      for (const d of list) {
+        if (d.kind === "label") {
+          const lab = this.labels[d.obj] && this.labels[d.obj][d.label];
+          if (!lab) continue;
+          shown.add(lab);
+          const { el, wrap, spec } = lab;
+          wrap.setAttribute("transform", `translate(${fmt(d.at[0] - spec.w / 2)} ${fmt(d.at[1] - spec.h / 2)})`);
+          wrap.style.display = "";
+          if (d.alpha < 1 - 1e-6) wrap.setAttribute("opacity", fmt(d.alpha));
+          else wrap.removeAttribute("opacity");
+          if (spec.depth) order.push(el);
+          continue;
+        }
+        for (const ps of pathSpecs(d)) {
+          const p = this.node(n++);
+          p.setAttribute("d", ps.d);
+          if (ps.fill) {
+            p.setAttribute("fill", ps.fill[0]);
+            p.setAttribute("fill-opacity", fmt(ps.fill[1]));
+          } else {
+            p.setAttribute("fill", "none");
+            p.removeAttribute("fill-opacity");
+          }
+          if (ps.stroke) {
+            p.setAttribute("stroke", ps.stroke[0]);
+            p.setAttribute("stroke-opacity", fmt(ps.stroke[1]));
+            p.setAttribute("stroke-width", fmt(ps.stroke[2]));
+          } else {
+            p.setAttribute("stroke", "none");
+            p.removeAttribute("stroke-opacity");
+            p.removeAttribute("stroke-width");
+          }
+          order.push(p);
+        }
+      }
+      // Hide labels that are not drawn (clipped or invisible).
+      for (const labs of this.labels)
+        for (const lab of labs) if (lab && !shown.has(lab)) lab.wrap.style.display = "none";
+      // Bring the group's children into the drawing order.
+      const kids = this.group.children;
+      let same = kids.length === order.length;
+      for (let i = 0; same && i < order.length; i++) same = kids[i] === order[i];
+      if (!same) this.group.replaceChildren(...order);
+    }
+  }
 
   // ---------------------------------------------------------------- morphs
 
@@ -975,9 +1398,14 @@
     show(i, mode = "end") {
       this.stop();
       i = clamp(i, 0, this.count - 1);
+      // Looking around with the mouse is per page: reset instantly.
+      DRAG.clear();
+      this.dragEase = null;
       this.page = i;
       for (const stage of this.liveStages()) stage.render(this, i);
       if (this.presenter) this.presenter.renderNext();
+      for (const stage of this.liveStages())
+        stage.root.style.touchAction = stage.scenes.some((sc) => sc.world) ? "none" : "";
       const active = this.audience.scenes.filter((s) => s.active);
       this.duration = active.reduce((m, s) => Math.max(m, s.rec.duration), 0);
       if (mode === "play" && !reducedMotion && this.duration > 0) {
@@ -1081,6 +1509,8 @@
           return document.body.classList.toggle("tys-show-notes");
         case "presenter":
           return this.openPresenter();
+        case "reset-view":
+          return this.resetView();
         case "timer.toggle":
           this.timer.toggle();
           return this.presenter && this.presenter.update();
@@ -1091,6 +1521,77 @@
         case "notes.smaller":
           return this.presenter && this.presenter.resizeNotes(cmd === "notes.larger" ? 1 : -1);
       }
+    }
+
+    // ---- drag to rotate (3D scenes) ----
+
+    worlds(key) {
+      const out = [];
+      for (const stage of this.liveStages())
+        for (const sc of stage.scenes) if (sc.world && (!key || sc.rec.scene.key === key)) out.push(sc.world);
+      return out;
+    }
+
+    redraw3d(key) {
+      for (const w of this.worlds(key)) w.redraw();
+    }
+
+    // The scene (with a 3D world) under a client point of a stage.
+    worldAt(stageEl, x, y) {
+      const stage = this.liveStages().find((st) => st.root === stageEl);
+      if (!stage) return null;
+      for (const sc of stage.scenes) {
+        if (!sc.world) continue;
+        const r = sc.root.getBoundingClientRect();
+        if (x >= r.left && x <= r.right && y >= r.top && y <= r.bottom) return sc;
+      }
+      return null;
+    }
+
+    // Change the drag offset of a scene. The polar angle seen is kept within
+    // [1°, 179°] by limiting the offset only (the scripted angle may be
+    // anything, e.g. 350°, and never jumps).
+    nudge(sc, dphi, dtheta, zoom) {
+      const key = sc.rec.scene.key;
+      const off = DRAG.get(key) || { dphi: 0, dtheta: 0, zoom: 1 };
+      const phi = evalObject(sc.rec.camera, sc.rec.rates, sc.world.time).phi;
+      const m = ((phi % 360) + 360) % 360;
+      let [lo, hi] = m <= 180 ? [1 - m, 179 - m] : [181 - m, 359 - m];
+      lo = Math.min(lo, 0);
+      hi = Math.max(hi, 0);
+      off.dphi = clamp(off.dphi + dphi, lo, hi);
+      off.dtheta += dtheta;
+      off.zoom = clamp(off.zoom * zoom, 0.25, 4);
+      DRAG.set(key, off);
+      this.redraw3d(key);
+    }
+
+    // `0`: ease the offsets of this page back to the script.
+    resetView() {
+      if (!DRAG.size) return;
+      const from = new Map([...DRAG].map(([k, v]) => [k, { ...v }]));
+      const done = () => {
+        DRAG.clear();
+        this.dragEase = null;
+        this.redraw3d();
+      };
+      const win = this.scheduler.visibleWindow();
+      if (reducedMotion || !win) return done();
+      const ticket = (this.dragEase = {});
+      const start = performance.now();
+      const frame = () => {
+        if (this.dragEase !== ticket) return;
+        const f = Math.min(1, (performance.now() - start) / 300);
+        if (f >= 1) return done();
+        const k = 1 - (f * f * (3 - 2 * f));
+        for (const [key, v] of from)
+          DRAG.set(key, { dphi: v.dphi * k, dtheta: v.dtheta * k, zoom: Math.pow(v.zoom, k) });
+        this.redraw3d();
+        const w = this.scheduler.visibleWindow();
+        if (w) w.requestAnimationFrame(frame);
+        else done();
+      };
+      win.requestAnimationFrame(frame);
     }
 
     // Open (or re-attach to) the presenter window. Attaching renders the
@@ -1312,7 +1813,7 @@
     if (k === "End") return "last";
     const lower = k.length === 1 ? k.toLowerCase() : "";
     return (
-      { r: "replay", n: "notes", f: "fullscreen", p: "presenter", s: "presenter", t: "timer.toggle" }[
+      { r: "replay", n: "notes", f: "fullscreen", p: "presenter", s: "presenter", t: "timer.toggle", 0: "reset-view" }[
         lower
       ] || null
     );
@@ -1341,9 +1842,64 @@
       },
       { signal }
     );
+    // Drag on a 3D scene to look around; the click ending a drag is ignored.
+    let drag = null;
+    let swallowClick = false;
+    if (stageEl) {
+      stageEl.addEventListener(
+        "pointerdown",
+        (e) => {
+          if (e.button !== 0) return;
+          const sc = player.worldAt(stageEl, e.clientX, e.clientY);
+          if (!sc) return;
+          drag = { sc, x: e.clientX, y: e.clientY, id: e.pointerId, moved: false };
+        },
+        { signal }
+      );
+      stageEl.addEventListener(
+        "pointermove",
+        (e) => {
+          if (!drag || e.pointerId !== drag.id) return;
+          const dx = e.clientX - drag.x, dy = e.clientY - drag.y;
+          if (!drag.moved) {
+            if (Math.hypot(dx, dy) < 4) return;
+            drag.moved = true;
+            try {
+              stageEl.setPointerCapture(e.pointerId);
+            } catch (_) {}
+          }
+          drag.x = e.clientX;
+          drag.y = e.clientY;
+          player.nudge(drag.sc, -dy * 0.4, -dx * 0.4, 1);
+          e.preventDefault();
+        },
+        { signal }
+      );
+      const end = (e) => {
+        if (!drag || e.pointerId !== drag.id) return;
+        if (drag.moved) swallowClick = e.type === "pointerup";
+        drag = null;
+      };
+      stageEl.addEventListener("pointerup", end, { signal });
+      stageEl.addEventListener("pointercancel", end, { signal });
+      stageEl.addEventListener(
+        "wheel",
+        (e) => {
+          const sc = player.worldAt(stageEl, e.clientX, e.clientY);
+          if (!sc) return;
+          e.preventDefault();
+          player.nudge(sc, 0, 0, Math.exp(-e.deltaY * 0.001));
+        },
+        { signal, passive: false }
+      );
+    }
     doc.addEventListener(
       "click",
       (e) => {
+        if (swallowClick) {
+          swallowClick = false;
+          return;
+        }
         const button = e.target && e.target.closest && e.target.closest("[data-cmd]");
         if (button) return player.command(button.dataset.cmd);
         if (e.button === 0 && stageEl && stageEl.contains(e.target)) player.next();
@@ -1398,6 +1954,14 @@
         command: (cmd) => player.command(cmd),
         states: (t) => player.scenes.map((s) => ({ key: s.rec.scene.key, states: s.states(t) })),
         morphs: () => player.scenes.flatMap((s) => s.morphs.map((m) => m.info)),
+        drag: (key) => DRAG.get(key) || null,
+        kernel: { makeView, toCamera, toScreen, drawables, matRotation, matMul, matApply, stepsMatrix },
+        world: () =>
+          player.scenes.filter((s) => s.world).map((s) => ({
+            key: s.rec.scene.key,
+            list: s.world.lastList,
+            positions: s.world.lastItems.map((i) => i.pos),
+          })),
       };
       document.body.dataset.ready = "true";
     } catch (err) {

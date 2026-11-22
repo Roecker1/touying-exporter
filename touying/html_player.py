@@ -114,7 +114,7 @@ def extract_scene_records(svg: str) -> Tuple[str, list]:
 
     def take(match):
         value = json.loads(htmllib.unescape(match.group(1)))
-        if value.get("schema") != 1:
+        if value.get("schema") not in (1, 2):
             raise ExportError(
                 f"unsupported touying-scene schema {value.get('schema')!r}; "
                 "update touying-exporter"
@@ -222,7 +222,8 @@ def extract_knots(svg: str, records: list) -> str:
     for record in records:
         for obj in record.get("objects", []):
             knots = obj.get("knots")
-            if not knots:
+            # 3D objects carry geometry knots (positions) in the record itself.
+            if not knots or knots.get("kind") == "geom":
                 continue
             skeletons, keys, items = [], {}, []
             for label in knots.pop("labels"):
