@@ -8,3 +8,5 @@ dist
 *.pdf
 *.pdfpc
 *.typ
+.venv/
+.pytest_cache/

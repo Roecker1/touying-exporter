@@ -9,7 +9,7 @@ authors = [
     {name = "OrangeX4", email = "318483724@qq.com"}
 ]
 dependencies = [
-    "typst>=0.14.4",
+    "typst>=0.15.2",
     "python-pptx>=0.6",
     "pillow",
     "jinja2",
@@ -31,4 +31,4 @@ packages = {find = {exclude = ["tests"]}}
 py-modules = ["touying"]
 
 [tool.setuptools.package-data]
-touying = ["*.j2"]
+touying = ["*.j2", "player/*"]
