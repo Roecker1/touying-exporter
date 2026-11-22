@@ -5,7 +5,15 @@ Export presentation slides in various formats for Touying.
 
 ## HTML Export
 
-We generate SVG image files and package them with impress.js into an HTML file. This way, you can open and present it using a browser, and it supports GIF animations and speaker notes.
+The HTML export renders every page to SVG and packs the deck into **one self-contained, offline HTML file**. It also plays touying's manim-style [scenes](https://github.com/touying-typ/touying): fades, drawing, writing, moves, rotations, paths and value trackers.
+
+- **Small:** glyphs, clip paths and gradients are stored once per deck rather than once per page, and the payload is gzip-compressed and decoded in the browser.
+- **Faithful:** scenes are rendered by Typst. The player only animates labelled groups, using the same model and easing tables as the PDF output.
+- **Smooth trackers and morphs:** value trackers with `interpolate: true` are blended between Typst-rendered samples wherever their SVG structure matches. `transform-matching` morphs equations glyph by glyph, with a crossfade where an overlay could not look right.
+- **Presenter keys:** arrow keys, space or click to go forward; a click during an animation finishes it. <kbd>R</kbd> replays the step, <kbd>N</kbd> shows the speaker notes, <kbd>F</kbd> toggles fullscreen.
+- **Presenter window:** <kbd>P</kbd> (or <kbd>S</kbd>) opens a second window that shows the current page live, the next page, the speaker notes and a timer (<kbd>T</kbd> pauses it). Both windows navigate the deck. Animations run on a single clock and keep playing while either window is visible.
+
+`--html-engine impress` selects the previous impress.js export. `--no-compress` embeds the deck as plain JSON for debugging or for very old browsers.
 
 ![image](https://github.com/touying-typ/touying-exporter/assets/34951714/207ddffc-87c8-4976-9bf4-4c6c5e2573ea)
 
@@ -29,7 +37,7 @@ pip install touying
 ## CLI
 
 ```text
-usage: touying compile [-h] [--output OUTPUT] [--root ROOT] [--font-paths [FONT_PATHS ...]] [--start-page START_PAGE] [--count COUNT] [--ppi PPI] [--silent SILENT] [--format {html,pptx,pdf,pdfpc}] [--sys-inputs SYS_INPUTS] input
+usage: touying compile [-h] [--output OUTPUT] [--root ROOT] [--font-paths [FONT_PATHS ...]] [--start-page START_PAGE] [--count COUNT] [--ppi PPI] [--silent SILENT] [--format {html,pptx,pdf,pdfpc}] [--html-engine {player,impress}] [--no-compress] [--sys-inputs SYS_INPUTS] input
 
 positional arguments:
   input                 Input file
@@ -47,6 +55,9 @@ options:
   --silent SILENT       Run silently
   --format {html,pptx,pdf,pdfpc}
                         Output format
+  --html-engine {player,impress}
+                        HTML engine: the compact scene player (default) or the legacy impress.js export
+  --no-compress         Embed the HTML payload as plain JSON instead of gzip+base64
   --sys-inputs SYS_INPUTS
                         JSON string to pass to typst's sys.inputs
 ```
@@ -91,3 +102,13 @@ touying.to_html("example.typ")
 - [impress.js](https://github.com/impress/impress.js)
 - [typst-py](https://github.com/messense/typst-py)
 - [python-pptx](https://github.com/scanny/python-pptx)
+
+## Development
+
+```sh
+python -m venv .venv && .venv/bin/pip install -e . pytest playwright
+.venv/bin/python -m playwright install chromium
+TOUYING_ROOT=/path/to/touying .venv/bin/python -m pytest tests
+```
+
+The end-to-end tests in `tests/e2e` export the scene decks in touying's `tests/features/scene` and drive the player with Playwright. When touying-exporter is checked out as touying's `dependencies/touying-exporter` submodule, `TOUYING_ROOT` is found automatically. `TOUYING_BROWSERS=chromium,firefox,webkit` runs them in more browsers.
