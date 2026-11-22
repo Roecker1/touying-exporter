@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="generator" content="touying-exporter">
+<title>{{ title | e }}</title>
+<style>
+{{ player_css }}
+</style>
+</head>
+<body>
+<svg id="tys-defs" aria-hidden="true" focusable="false" width="0" height="0"></svg>
+<main id="tys-stage" aria-live="polite"></main>
+<div id="tys-notes" role="note"></div>
+<div id="tys-counter" aria-hidden="true"></div>
+<script id="tys-payload" type="application/octet-stream" data-encoding="{{ encoding }}">{{ payload }}</script>
+{% if player_compressed %}
+<script id="tys-player-code" type="application/octet-stream">{{ player_js }}</script>
+<script>
+(async () => {
+  try {
+    if (typeof DecompressionStream === "undefined") {
+      throw new Error("This browser cannot decompress the presentation. Use a current browser, or export with --no-compress.");
+    }
+    const bin = atob(document.getElementById("tys-player-code").textContent.trim());
+    const bytes = Uint8Array.from(bin, (c) => c.charCodeAt(0));
+    const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("gzip"));
+    const script = document.createElement("script");
+    script.textContent = await new Response(stream).text();
+    document.body.append(script);
+  } catch (err) {
+    document.getElementById("tys-stage").textContent = String((err && err.message) || err);
+    document.body.dataset.ready = "error";
+  }
+})();
+</script>
+{% else %}
+<script>
+{{ player_js }}
+</script>
+{% endif %}
+</body>
+</html>

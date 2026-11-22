@@ -9,10 +9,49 @@ import jinja2
 import os
 import re
 
+from .html_player import export_html
+
 FILE_PATH = os.path.dirname(os.path.realpath(__file__))
 
 
 def to_html(
+    input,
+    root=None,
+    font_paths=[],
+    output=None,
+    start_page=1,
+    count=None,
+    silent=False,
+    sys_inputs={},
+    compress=True,
+    engine="player",
+):
+    """Export a self-contained HTML presentation.
+
+    ``engine="player"`` (default) deduplicates glyphs across pages, compresses
+    the deck and plays touying scenes; ``engine="impress"`` is the previous
+    impress.js export, kept for compatibility.
+    """
+    if engine == "player":
+        return export_html(
+            input,
+            output=output,
+            root=root,
+            font_paths=font_paths,
+            sys_inputs=sys_inputs,
+            start_page=start_page,
+            count=count,
+            compress=compress,
+            silent=silent,
+        )
+    if engine != "impress":
+        raise ValueError(f"Unknown HTML engine: {engine}")
+    return to_html_impress(
+        input, root, font_paths, output, start_page, count, silent, sys_inputs
+    )
+
+
+def to_html_impress(
     input, root=None, font_paths=[], output=None, start_page=1, count=None, silent=False, sys_inputs={}
 ):
     if not silent:

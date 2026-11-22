@@ -1,0 +1,168 @@
+html,
+body {
+  margin: 0;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+}
+#tys-defs {
+  /* Not display:none: gradients and clip paths must stay renderable. */
+  position: absolute;
+  width: 0;
+  height: 0;
+  overflow: hidden;
+}
+#tys-stage {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: #ddd;
+  font: 16px/1.4 system-ui, sans-serif;
+  cursor: default;
+}
+#tys-stage > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+#tys-notes {
+  display: none;
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  max-height: 35%;
+  overflow: auto;
+  padding: 0.8em 1.2em;
+  background: rgba(20, 20, 20, 0.92);
+  color: #f0f0f0;
+  font: 18px/1.45 system-ui, sans-serif;
+  white-space: pre-wrap;
+}
+body.tys-show-notes #tys-notes:not(:empty),
+body.tys-show-notes #tys-counter {
+  display: block;
+}
+#tys-counter {
+  display: none;
+  position: fixed;
+  right: 0.6em;
+  bottom: 0.4em;
+  color: rgba(128, 128, 128, 0.7);
+  font: 12px system-ui, sans-serif;
+  pointer-events: none;
+}
+#tys-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 1.5em;
+  transform: translateX(-50%);
+  max-width: 80%;
+  padding: 0.6em 1em;
+  border-radius: 6px;
+  background: rgba(30, 30, 30, 0.92);
+  color: #fff;
+  font: 15px/1.4 system-ui, sans-serif;
+  opacity: 0;
+  transition: opacity 0.2s;
+  pointer-events: none;
+}
+#tys-toast.tys-visible {
+  opacity: 1;
+}
+
+/* Presenter window (a separate document that receives a copy of this CSS). */
+body.tys-presenter {
+  box-sizing: border-box;
+  height: 100vh;
+  margin: 0;
+  padding: 10px;
+  display: grid;
+  grid-template-columns: minmax(0, 62fr) minmax(0, 38fr);
+  grid-template-rows: minmax(0, 1fr) auto;
+  gap: 10px;
+  background: #1c1c21;
+  color: #eee;
+  font: 16px/1.4 system-ui, sans-serif;
+  overflow: hidden;
+}
+.tys-p-current,
+.tys-p-next {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 0;
+  background: #000;
+  cursor: default;
+}
+.tys-p-current > svg,
+.tys-p-next > svg {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.tys-p-next {
+  aspect-ratio: var(--tys-aspect, 16 / 9);
+  width: 100%;
+}
+.tys-p-side {
+  display: grid;
+  grid-template-rows: auto minmax(0, 1fr);
+  gap: 10px;
+  min-height: 0;
+}
+.tys-p-label {
+  margin-bottom: 4px;
+  color: #999;
+  font-size: 13px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.tys-notes-pane {
+  overflow: auto;
+  padding: 12px 14px;
+  border-radius: 6px;
+  background: #26262d;
+  font-size: 22px;
+  white-space: pre-wrap;
+  outline: none;
+}
+.tys-notes-pane:empty::before {
+  content: "No notes for this page.";
+  color: #777;
+}
+.tys-bar {
+  grid-column: 1 / 3;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.tys-bar button {
+  padding: 4px 10px;
+  border: 1px solid #555;
+  border-radius: 4px;
+  background: #2d2d35;
+  color: #eee;
+  font: inherit;
+  cursor: pointer;
+}
+.tys-timer {
+  font-size: 30px;
+  font-variant-numeric: tabular-nums;
+}
+.tys-timer.tys-paused {
+  color: #e0a040;
+}
+.tys-clock,
+.tys-count {
+  color: #aaa;
+  font-variant-numeric: tabular-nums;
+}
+.tys-spacer {
+  flex: 1;
+}
+.tys-end {
+  color: #888;
+}

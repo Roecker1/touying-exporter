@@ -40,6 +40,17 @@ def main():
         help="Output format",
     )
     parser_compile.add_argument(
+        "--html-engine",
+        choices=["player", "impress"],
+        default="player",
+        help="HTML engine: the compact scene player (default) or the legacy impress.js export",
+    )
+    parser_compile.add_argument(
+        "--no-compress",
+        action="store_true",
+        help="Embed the HTML payload as plain JSON instead of gzip+base64 (debugging, old browsers)",
+    )
+    parser_compile.add_argument(
         "--sys-inputs",
         default=None,
         help="JSON string to pass to typst's sys.inputs",
@@ -67,6 +78,8 @@ def main():
                 count=args.count,
                 silent=args.silent,
                 sys_inputs=sys_inputs_dict,
+                compress=not args.no_compress,
+                engine=args.html_engine,
             )
         elif args.format == "pptx":
             exporter.to_pptx(
