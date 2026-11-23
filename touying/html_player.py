@@ -114,7 +114,7 @@ def extract_scene_records(svg: str) -> Tuple[str, list]:
 
     def take(match):
         value = json.loads(htmllib.unescape(match.group(1)))
-        if value.get("schema") not in (1, 2):
+        if value.get("schema") not in (1, 2, 3):
             raise ExportError(
                 f"unsupported touying-scene schema {value.get('schema')!r}; "
                 "update touying-exporter"
@@ -192,6 +192,27 @@ def _split_numbers(name: str, value: str):
     return _NUM_RE.split(value), numbers
 
 
+_PATH_TAG_RE = re.compile(r"<path\b[^>]*>")
+_ONE_ARG_TRANSLATE_RE = re.compile(rf'transform="translate\(\s*({_NUM})\s*\)"')
+
+
+def _canonical_paths(markup: str) -> str:
+    """Give every path the same transform form, so equal shapes tokenize alike.
+
+    Typst omits the transform of a path placed at the origin and writes
+    ``translate(x)`` when y is 0; both become ``translate(x y)``.
+    """
+
+    def fix(match):
+        tag = match.group(0)
+        if " transform=" not in tag:
+            end = -2 if tag.endswith("/>") else -1
+            return tag[:end] + ' transform="translate(0 0)"' + tag[end:]
+        return _ONE_ARG_TRANSLATE_RE.sub(r'transform="translate(\1 0)"', tag)
+
+    return _PATH_TAG_RE.sub(fix, markup)
+
+
 def tokenize_knot(markup: str):
     """Split a knot group into (skeleton key, template, attrs, numbers).
 
@@ -199,13 +220,14 @@ def tokenize_knot(markup: str):
     numbers, element indices counting the root and its descendants in document
     order; `numbers` are their values in that order.
     """
-    template = re.sub(r' data-typst-label="[^"]*"', "", markup, count=1)
+    template = _canonical_paths(re.sub(r' data-typst-label="[^"]*"', "", markup, count=1))
     wrapper = f'<g xmlns="{SVG_NS}" xmlns:xlink="{XLINK_NS}" xmlns:h5="{H5_NS}">{template}</g>'
     root = ET.fromstring(wrapper)[0]
     key, attrs, numbers = [], [], []
     for index, el in enumerate(root.iter()):
         key.append(el.tag)
-        for name, value in el.attrib.items():
+        # Attribute order is not significant; sort so it cannot split skeletons.
+        for name, value in sorted(el.attrib.items()):
             split = _split_numbers(name, value)
             if split is None:
                 key.append(f"{name}={value}")
