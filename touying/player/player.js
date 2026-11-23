@@ -88,6 +88,8 @@
         s.ty = y;
       } else {
         s[tr.prop] = tr.v0 + (tr.v1 - tr.v0) * e;
+        // A passing flash's window width travels with its track.
+        if (tr.w !== undefined) s.passW = tr.w;
       }
     }
     return s;
@@ -231,7 +233,7 @@
       const knot = K.knots[sel.k];
       const sk = this.skeleton(knot.s);
       if (this.mounted !== sk) {
-        if (this.drawing) this.applyDraw(1);
+        if (this.drawing) this.applyStroke(1);
         if (this.mounted) this.mounted.el.remove();
         this.inner.appendChild(sk.el);
         this.mounted = sk;
@@ -274,13 +276,18 @@
       }
     }
 
-    applyDraw(d) {
-      if (d >= 1 - 1e-6) {
+    // Owns the stroke dash state of the object's leaves: `create` (draw < 1)
+    // and passing flashes (pass >= 0, window width w). Both neutral restores
+    // everything, so seeks in any order are idempotent.
+    applyStroke(d, pass = -1, w = 0.3) {
+      const passing = pass !== undefined && pass >= 0;
+      if (!passing && d >= 1 - 1e-6) {
         if (!this.drawing) return;
         for (const p of this.strokes) {
           p.removeAttribute("pathLength");
           p.style.strokeDasharray = "";
           p.style.strokeDashoffset = "";
+          p.style.opacity = "";
         }
         for (const o of this.others) o.style.opacity = "";
         this.drawing = false;
@@ -288,11 +295,26 @@
       }
       if (!this.strokes) this.classify();
       this.drawing = true;
+      if (passing) {
+        // manim's ShowPassingFlash window; empty at both ends.
+        const upper = Math.min((1 + w) * pass, 1);
+        const lower = Math.max((1 + w) * pass - w, 0);
+        const len = upper - lower;
+        for (const p of this.strokes) {
+          p.setAttribute("pathLength", "1");
+          p.style.strokeDasharray = `${num(Math.max(len, 0))} 2`;
+          p.style.strokeDashoffset = num(-lower);
+          p.style.opacity = len > 1e-6 ? "" : "0";
+        }
+        for (const o of this.others) o.style.opacity = "0";
+        return;
+      }
       const v = clamp(d, 0, 1);
       for (const p of this.strokes) {
         p.setAttribute("pathLength", "1");
         p.style.strokeDasharray = "1 1";
         p.style.strokeDashoffset = num(1 - v);
+        p.style.opacity = "";
       }
       // Fills, glyphs, images and marks cannot be stroked in: fade them.
       for (const o of this.others) o.style.opacity = num(v);
@@ -351,7 +373,7 @@
         );
 
       if (op > 0) {
-        this.applyDraw(s.draw);
+        this.applyStroke(s.draw, s.pass, s.passW);
         this.applyReveal(s.reveal);
       }
 
@@ -395,6 +417,10 @@
       for (const m of this.morphs) if (!m.ready) m.setup();
       this.applyObjects(tt);
       if (this.world) this.world.apply(tt);
+      // Morph ownership: clear every override first, then let the active
+      // morphs (in timeline order) set theirs, so an inactive morph never
+      // undoes an active one on a shared object (A -> B -> C).
+      for (const m of this.morphs) m.clear();
       for (const m of this.morphs) m.apply(tt);
     }
 
@@ -952,6 +978,420 @@
     return out.sort((x, y) => x[0] - y[0]);
   }
 
+  // ------------------------------------------------------------ shape morphs
+  //
+  // `transform` in the HTML export: outlines morph point by point. Leaves
+  // (paths and glyphs) are paired by position; inside a pair, contours are
+  // paired by size and their cubic segments aligned. The crossfade tracks
+  // stay authoritative: anything outside the supported subset falls back to
+  // them, writing no overrides.
+
+  const SHAPE_BUDGET = { leaves: 256, contours: 64, curves: 8000, rotate: 512 };
+
+  class MorphError extends Error {}
+
+  const PATH_TOKEN = /[a-zA-Z]|[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?/g;
+
+  // SVG path data -> contours [{segs: [[x0,y0,c1x,c1y,c2x,c2y,x1,y1], ..], closed}]
+  // in absolute coordinates. Lines and quadratics become exact cubics.
+  function parsePath(d) {
+    const toks = d.match(PATH_TOKEN) || [];
+    const isCmd = (t) => /^[a-zA-Z]$/.test(t);
+    const contours = [];
+    let i = 0, cmd = null, cur = null;
+    let x = 0, y = 0, sx = 0, sy = 0, lastC = null, lastQ = null;
+    const num = () => {
+      if (i >= toks.length || isCmd(toks[i])) throw new MorphError("malformed path data");
+      return parseFloat(toks[i++]);
+    };
+    const start = (nx, ny) => {
+      cur = { segs: [], closed: false };
+      contours.push(cur);
+      x = sx = nx;
+      y = sy = ny;
+    };
+    const cubic = (c1x, c1y, c2x, c2y, ex, ey) => {
+      if (!cur || cur.closed) start(x, y); // drawing after Z starts a subpath
+      cur.segs.push([x, y, c1x, c1y, c2x, c2y, ex, ey]);
+      x = ex;
+      y = ey;
+    };
+    const line = (ex, ey) =>
+      cubic(x + (ex - x) / 3, y + (ey - y) / 3, x + (2 * (ex - x)) / 3, y + (2 * (ey - y)) / 3, ex, ey);
+    const quad = (qx, qy, ex, ey) =>
+      cubic(x + (2 / 3) * (qx - x), y + (2 / 3) * (qy - y), ex + (2 / 3) * (qx - ex), ey + (2 / 3) * (qy - ey), ex, ey);
+    while (i < toks.length) {
+      if (isCmd(toks[i])) cmd = toks[i++];
+      else if (cmd === null) throw new MorphError("malformed path data");
+      const rel = cmd !== cmd.toUpperCase();
+      const ox = rel ? x : 0, oy = rel ? y : 0;
+      switch (cmd.toUpperCase()) {
+        case "M": {
+          const nx = num() + ox, ny = num() + oy;
+          start(nx, ny);
+          cmd = rel ? "l" : "L"; // further pairs are lines
+          lastC = lastQ = null;
+          break;
+        }
+        case "L": {
+          const nx = num() + ox, ny = num() + oy;
+          line(nx, ny);
+          lastC = lastQ = null;
+          break;
+        }
+        case "H":
+          line(num() + ox, y);
+          lastC = lastQ = null;
+          break;
+        case "V":
+          line(x, num() + oy);
+          lastC = lastQ = null;
+          break;
+        case "C": {
+          const a = num() + ox, b = num() + oy, c = num() + ox, e = num() + oy, f = num() + ox, g = num() + oy;
+          cubic(a, b, c, e, f, g);
+          lastC = [c, e];
+          lastQ = null;
+          break;
+        }
+        case "S": {
+          const [c1x, c1y] = lastC ? [2 * x - lastC[0], 2 * y - lastC[1]] : [x, y];
+          const c = num() + ox, e = num() + oy, f = num() + ox, g = num() + oy;
+          cubic(c1x, c1y, c, e, f, g);
+          lastC = [c, e];
+          lastQ = null;
+          break;
+        }
+        case "Q": {
+          const qx = num() + ox, qy = num() + oy, ex = num() + ox, ey = num() + oy;
+          quad(qx, qy, ex, ey);
+          lastQ = [qx, qy];
+          lastC = null;
+          break;
+        }
+        case "T": {
+          const [qx, qy] = lastQ ? [2 * x - lastQ[0], 2 * y - lastQ[1]] : [x, y];
+          const ex = num() + ox, ey = num() + oy;
+          quad(qx, qy, ex, ey);
+          lastQ = [qx, qy];
+          lastC = null;
+          break;
+        }
+        case "Z":
+          if (cur && !cur.closed) {
+            if (Math.hypot(x - sx, y - sy) > 1e-9) line(sx, sy);
+            cur.closed = true;
+          }
+          x = sx;
+          y = sy;
+          lastC = lastQ = null;
+          break;
+        case "A":
+          throw new MorphError("arcs are not supported");
+        default:
+          throw new MorphError(`unknown path command "${cmd}"`);
+      }
+    }
+    // A contour that ends where it starts is closed (Typst writes circles
+    // without Z).
+    for (const c of contours) {
+      if (c.closed || !c.segs.length) continue;
+      const a = c.segs[0], b = c.segs[c.segs.length - 1];
+      const size = Math.max(...c.segs.map((q) => Math.abs(q[6] - a[0]) + Math.abs(q[7] - a[1])));
+      if (size > 1e-9 && Math.hypot(b[6] - a[0], b[7] - a[1]) <= 1e-6 * size) c.closed = true;
+    }
+    return contours.filter((c) => c.segs.length);
+  }
+
+  function mapSeg(m, s) {
+    const out = new Array(8);
+    for (let k = 0; k < 8; k += 2) {
+      out[k] = m.a * s[k] + m.c * s[k + 1] + m.e;
+      out[k + 1] = m.b * s[k] + m.d * s[k + 1] + m.f;
+    }
+    return out;
+  }
+
+  // Rotation, uniform scale and reflection (Typst's y flip included).
+  function isConformal(m) {
+    const n1 = m.a * m.a + m.b * m.b, n2 = m.c * m.c + m.d * m.d;
+    return n1 > 1e-12 && Math.abs(n1 - n2) < 1e-6 * n1 && Math.abs(m.a * m.c + m.b * m.d) < 1e-6 * n1;
+  }
+
+  function contourArea(c) {
+    let a = 0;
+    for (const s of c.segs) {
+      // Shoelace over the control polygon: exact sign for the usual shapes.
+      for (let k = 0; k < 6; k += 2) a += s[k] * s[k + 3] - s[k + 2] * s[k + 1];
+    }
+    return a / 2;
+  }
+
+  function contourCentre(c) {
+    let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+    for (const s of c.segs)
+      for (let k = 0; k < 8; k += 2) {
+        x0 = Math.min(x0, s[k]);
+        x1 = Math.max(x1, s[k]);
+        y0 = Math.min(y0, s[k + 1]);
+        y1 = Math.max(y1, s[k + 1]);
+      }
+    return { x: (x0 + x1) / 2, y: (y0 + y1) / 2, box: { x: x0, y: y0, w: x1 - x0, h: y1 - y0 } };
+  }
+
+  function reverseContour(c) {
+    const segs = c.segs
+      .slice()
+      .reverse()
+      .map((s) => [s[6], s[7], s[4], s[5], s[2], s[3], s[0], s[1]]);
+    return { segs, closed: c.closed };
+  }
+
+  function degenerateLike(c, x, y) {
+    return { segs: c.segs.map(() => [x, y, x, y, x, y, x, y]), closed: c.closed };
+  }
+
+  // Split the longest segments at t = 1/2 until the contour has n segments.
+  function splitTo(c, n) {
+    const segs = c.segs.slice();
+    const len = (s) =>
+      Math.hypot(s[2] - s[0], s[3] - s[1]) + Math.hypot(s[4] - s[2], s[5] - s[3]) + Math.hypot(s[6] - s[4], s[7] - s[5]);
+    while (segs.length < n) {
+      let best = 0;
+      for (let k = 1; k < segs.length; k++) if (len(segs[k]) > len(segs[best]) + 1e-12) best = k;
+      const s = segs[best];
+      const m = (a, b) => [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+      const p0 = [s[0], s[1]], p1 = [s[2], s[3]], p2 = [s[4], s[5]], p3 = [s[6], s[7]];
+      const a = m(p0, p1), b = m(p1, p2), c2 = m(p2, p3), ab = m(a, b), bc = m(b, c2), mid = m(ab, bc);
+      segs.splice(best, 1, [...p0, ...a, ...ab, ...mid], [...mid, ...bc, ...c2, ...p3]);
+    }
+    return { segs, closed: c.closed };
+  }
+
+  // Rotate the segments of closed contour b to best match a.
+  function rotateToMatch(a, b) {
+    const n = a.segs.length;
+    if (!b.closed || n > SHAPE_BUDGET.rotate) return b;
+    let best = 0, bestCost = Infinity;
+    for (let k = 0; k < n; k++) {
+      let cost = 0;
+      for (let i = 0; i < n && cost < bestCost; i++) {
+        const p = a.segs[i], q = b.segs[(i + k) % n];
+        cost += (p[0] - q[0]) ** 2 + (p[1] - q[1]) ** 2;
+      }
+      if (cost < bestCost) {
+        bestCost = cost;
+        best = k;
+      }
+    }
+    return { segs: b.segs.slice(best).concat(b.segs.slice(0, best)), closed: true };
+  }
+
+  function parseColour(v) {
+    if (!v || v === "none") return null;
+    let m = /^#([0-9a-f]{3})$/i.exec(v);
+    if (m) return [...m[1]].map((h) => parseInt(h + h, 16)).concat(1);
+    m = /^#([0-9a-f]{6})([0-9a-f]{2})?$/i.exec(v);
+    if (m) {
+      const h = m[1];
+      return [0, 2, 4].map((k) => parseInt(h.slice(k, k + 2), 16)).concat(m[2] ? parseInt(m[2], 16) / 255 : 1);
+    }
+    return undefined; // a paint server or a colour syntax we cannot lerp
+  }
+
+  // Paint of a leaf. `use` elements carry the paint of their glyph.
+  function paintOf(el, inner) {
+    const get = (n, dflt) => {
+      const v = el.getAttribute(n) ?? (inner ? inner.getAttribute(n) : null);
+      return v === null ? dflt : v;
+    };
+    const p = {
+      fill: get("fill", "#000000"),
+      fillOpacity: parseFloat(get("fill-opacity", "1")),
+      stroke: get("stroke", "none"),
+      strokeOpacity: parseFloat(get("stroke-opacity", "1")),
+      strokeWidth: parseFloat(get("stroke-width", "1")),
+      linecap: get("stroke-linecap", "butt"),
+      linejoin: get("stroke-linejoin", "miter"),
+      miterlimit: get("stroke-miterlimit", "4"),
+      fillRule: get("fill-rule", "nonzero"),
+      dash: get("stroke-dasharray", "none"),
+      markers: ["marker-start", "marker-mid", "marker-end"].some((n) => get(n, "none") !== "none"),
+      opacity: parseFloat(get("opacity", "1")),
+    };
+    p.fillRGBA = parseColour(p.fill);
+    p.strokeRGBA = parseColour(p.stroke);
+    p.stroked = p.stroke !== "none";
+    // Lerpable: solid colours only, no dashes or markers, no element opacity.
+    p.simple =
+      p.fillRGBA !== undefined &&
+      p.strokeRGBA !== undefined &&
+      p.dash === "none" &&
+      !p.markers &&
+      Math.abs(p.opacity - 1) < 1e-9;
+    return p;
+  }
+
+  // Leaves of an object for a shape morph, in paint order, with geometry in
+  // the overlay parent's user space. Throws MorphError for unsupported content.
+  function shapeLeaves(view, base) {
+    const leaves = [];
+    const walk = (el) => {
+      for (const child of el.children) {
+        const tag = child.localName;
+        if (tag === "path" || tag === "use") {
+          const ctm = child.getCTM();
+          if (!ctm) throw new MorphError("not measurable");
+          let m = base.multiply(ctm);
+          let d, inner = null;
+          let cloneM = m;
+          if (tag === "use") {
+            const x = parseFloat(child.getAttribute("x")) || 0;
+            const y = parseFloat(child.getAttribute("y")) || 0;
+            m = m.translate(x, y);
+            cloneM = m;
+            const href = child.getAttribute("xlink:href") || child.getAttribute("href") || "";
+            const sym = href.startsWith("#") ? child.ownerDocument.getElementById(href.slice(1)) : null;
+            const kids = sym ? [...sym.children] : [];
+            if (kids.length !== 1 || kids[0].localName !== "path")
+              throw new MorphError(`unsupported glyph in ${view.rec.id}`);
+            inner = kids[0];
+            const t = inner.transform && inner.transform.baseVal.consolidate();
+            if (t) m = m.multiply(t.matrix);
+            d = inner.getAttribute("d");
+          } else {
+            d = child.getAttribute("d");
+          }
+          const paint = paintOf(child, inner);
+          // Invisible helpers (e.g. the CeTZ bounds rectangle).
+          if (paint.fill === "none" && !paint.stroked) continue;
+          leaves.push({ el: child, m, cloneM, d: d || "", paint });
+          continue;
+        }
+        if (isLeaf(child)) throw new MorphError(`unsupported <${tag}> in ${view.rec.id}`);
+        for (const a of child.attributes)
+          if (!INERT_ATTR.test(a.name)) throw new MorphError(`unsupported "${a.name}" inside ${view.rec.id}`);
+        walk(child);
+      }
+    };
+    walk(view.inner);
+    if (leaves.length > SHAPE_BUDGET.leaves) throw new MorphError("too many parts");
+    let curves = 0;
+    for (const leaf of leaves) {
+      const contours = parsePath(leaf.d).map((c) => ({ segs: c.segs.map((s) => mapSeg(leaf.m, s)), closed: c.closed }));
+      if (contours.length > SHAPE_BUDGET.contours) throw new MorphError("too many contours");
+      for (const c of contours) curves += c.segs.length;
+      leaf.contours = contours;
+      leaf.conformal = isConformal(leaf.m);
+      leaf.scale = Math.sqrt(Math.abs(leaf.m.a * leaf.m.d - leaf.m.b * leaf.m.c));
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+      for (const c of contours) {
+        const b = contourCentre(c).box;
+        x0 = Math.min(x0, b.x);
+        y0 = Math.min(y0, b.y);
+        x1 = Math.max(x1, b.x + b.w);
+        y1 = Math.max(y1, b.y + b.h);
+      }
+      if (!contours.length) x0 = y0 = x1 = y1 = 0;
+      leaf.box = { x: x0, y: y0, w: x1 - x0, h: y1 - y0 };
+      leaf.cx = (x0 + x1) / 2;
+      leaf.cy = (y0 + y1) / 2;
+    }
+    if (curves > SHAPE_BUDGET.curves) throw new MorphError("too many curves");
+    return leaves;
+  }
+
+  // Lerpable style of a leaf; `ghost` (an absent partner) is fully transparent.
+  function styleOf(leaf, other, ghost) {
+    const p = leaf ? leaf.paint : other.paint;
+    const scale = leaf ? leaf.scale : other.scale;
+    const pick = (rgba, alt) => (rgba ? rgba : alt ? [alt[0], alt[1], alt[2], 0] : [0, 0, 0, 0]);
+    const op = other ? other.paint : null;
+    const fill = pick(p.fillRGBA, op && op.fillRGBA);
+    const stroke = pick(p.strokeRGBA, op && op.strokeRGBA);
+    const fa = ghost || !p.fillRGBA ? 0 : fill[3] * p.fillOpacity;
+    const sa = ghost || !p.strokeRGBA ? 0 : stroke[3] * p.strokeOpacity;
+    const width = ghost || !p.stroked ? 0 : p.strokeWidth * scale;
+    return { fill, fa, stroke, sa, width };
+  }
+
+  // Overlap with a 0.5 px tolerance: touching boxes do not overlap.
+  function boxesOverlap(a, b, tol = 0.5) {
+    return a.x + tol < b.x + b.w && b.x + tol < a.x + a.w && a.y + tol < b.y + b.h && b.y + tol < a.y + a.h;
+  }
+
+  // Pair contours of two leaves and align them. Returns [[ca, cb], ..] or
+  // null if the pair cannot morph (open versus closed contours).
+  function alignContours(A, B) {
+    const order = (L) =>
+      L.contours
+        .map((c) => ({ c, area: contourArea(c), centre: contourCentre(c) }))
+        .sort(
+          (p, q) =>
+            Math.abs(q.area) - Math.abs(p.area) || p.centre.y - q.centre.y || p.centre.x - q.centre.x
+        );
+    const ca = A ? order(A) : [];
+    const cb = B ? order(B) : [];
+    const n = Math.max(ca.length, cb.length);
+    const pairs = [];
+    for (let k = 0; k < n; k++) {
+      let a = ca[k] ? ca[k].c : null;
+      let b = cb[k] ? cb[k].c : null;
+      if (a && b && a.closed !== b.closed) return null;
+      // A contour without a partner grows from / shrinks to its own centre.
+      if (!a) a = degenerateLike(b, cb[k].centre.x, cb[k].centre.y);
+      if (!b) b = degenerateLike(a, ca[k].centre.x, ca[k].centre.y);
+      pairs.push([a, b, ca[k] ? ca[k].area : 0, cb[k] ? cb[k].area : 0]);
+    }
+    // Orientation per leaf: reversing every contour of a leaf keeps its fill.
+    const closedDominant = pairs.length && pairs[0][0].closed && ca.length && cb.length;
+    const flip = closedDominant && Math.sign(pairs[0][2]) * Math.sign(pairs[0][3]) < 0;
+    const single = (A ? A.contours.length : 0) <= 1 && (B ? B.contours.length : 0) <= 1;
+    const unfilled = (!A || A.paint.fill === "none") && (!B || B.paint.fill === "none");
+    return pairs.map(([a, b]) => {
+      if (flip) b = reverseContour(b);
+      else if (!a.closed && (single || unfilled)) {
+        // Open curves: run in the direction that moves the ends least.
+        const s = a.segs[0], e = a.segs[a.segs.length - 1];
+        const s2 = b.segs[0], e2 = b.segs[b.segs.length - 1];
+        const same = Math.hypot(s[0] - s2[0], s[1] - s2[1]) + Math.hypot(e[6] - e2[6], e[7] - e2[7]);
+        const rev = Math.hypot(s[0] - e2[6], s[1] - e2[7]) + Math.hypot(e[6] - s2[0], e[7] - s2[1]);
+        if (rev < same - 1e-9) b = reverseContour(b);
+      }
+      const len = Math.max(a.segs.length, b.segs.length);
+      a = splitTo(a, len);
+      b = splitTo(b, len);
+      if (a.closed) b = rotateToMatch(a, b);
+      return [a, b];
+    });
+  }
+
+  // Can two leaves morph into each other (rather than crossfade)?
+  function compatible(A, B) {
+    const pa = A.paint, pb = B.paint;
+    if (!pa.simple || !pb.simple) return false;
+    if (pa.fillRule !== pb.fillRule) return false;
+    if (pa.stroked && pb.stroked && (pa.linecap !== pb.linecap || pa.linejoin !== pb.linejoin || pa.miterlimit !== pb.miterlimit))
+      return false;
+    if ((pa.stroked && !A.conformal) || (pb.stroked && !B.conformal)) return false;
+    return true;
+  }
+
+  function pathData(contours, f) {
+    let d = "";
+    const l = (a, b) => a + (b - a) * f;
+    for (const [a, b] of contours) {
+      const s0 = a.segs[0], t0 = b.segs[0];
+      d += `M${num(l(s0[0], t0[0]))} ${num(l(s0[1], t0[1]))}`;
+      for (let k = 0; k < a.segs.length; k++) {
+        const s = a.segs[k], t = b.segs[k];
+        d += `C${num(l(s[2], t[2]))} ${num(l(s[3], t[3]))} ${num(l(s[4], t[4]))} ${num(l(s[5], t[5]))} ${num(l(s[6], t[6]))} ${num(l(s[7], t[7]))}`;
+      }
+      if (a.closed) d += "Z";
+    }
+    return d;
+  }
+
   class MorphView {
     constructor(scene, rec) {
       this.scene = scene;
@@ -1042,6 +1482,7 @@
       this.src = src;
       this.dst = dst;
       if (!src || !dst) return this.fallback("object not on this page");
+      if (this.rec.kind === "shape") return this.setupShape();
       const s0 = evalObject(src.rec, rates, t0);
       const d1 = evalObject(dst.rec, rates, t1);
       if (s0.draw < 1 - 1e-6 || s0.reveal < 1 - 1e-6 || d1.draw < 1 - 1e-6 || d1.reveal < 1 - 1e-6)
@@ -1057,23 +1498,8 @@
       const B = this.collect(dst, base);
       if (A.reason || B.reason) return this.fallback(A.reason || B.reason);
 
-      // Objects drawn between the two would be crossed by the overlay.
-      const [lo, hi] = [src.rec.order, dst.rec.order].sort((x, y) => x - y);
-      const union = (r, q) => ({
-        left: Math.min(r.left, q.left),
-        top: Math.min(r.top, q.top),
-        right: Math.max(r.right, q.right),
-        bottom: Math.max(r.bottom, q.bottom),
-      });
-      const area = union(src.xf.getBoundingClientRect(), dst.xf.getBoundingClientRect());
-      for (const o of scene.objects) {
-        if (o.rec.order <= lo || o.rec.order >= hi) continue;
-        const visible = [t0, (t0 + t1) / 2, t1].some((t) => evalObject(o.rec, rates, t).opacity > 1e-6);
-        if (!visible) continue;
-        const r = o.xf.getBoundingClientRect();
-        if (r.right > area.left && r.left < area.right && r.bottom > area.top && r.top < area.bottom)
-          return this.fallback(`"${o.rec.id}" lies between them`);
-      }
+      const between = this.between();
+      if (between) return this.fallback(between);
 
       const [w, h] = scene.rec.scene.size;
       const tau = 0.5 * Math.hypot(w, h);
@@ -1201,21 +1627,229 @@
       this.info.tiers = tiers;
     }
 
+    // Objects drawn between the two would be crossed by the overlay.
+    between() {
+      const { t0, t1 } = this.rec;
+      const scene = this.scene, rates = scene.rec.rates;
+      const src = this.src, dst = this.dst;
+      const [lo, hi] = [src.rec.order, dst.rec.order].sort((x, y) => x - y);
+      const union = (r, q) => ({
+        left: Math.min(r.left, q.left),
+        top: Math.min(r.top, q.top),
+        right: Math.max(r.right, q.right),
+        bottom: Math.max(r.bottom, q.bottom),
+      });
+      const area = union(src.xf.getBoundingClientRect(), dst.xf.getBoundingClientRect());
+      for (const o of scene.objects) {
+        if (o.rec.order <= lo || o.rec.order >= hi) continue;
+        const visible = [t0, (t0 + t1) / 2, t1].some((t) => evalObject(o.rec, rates, t).opacity > 1e-6);
+        if (!visible) continue;
+        const r = o.xf.getBoundingClientRect();
+        if (r.right > area.left && r.left < area.right && r.bottom > area.top && r.top < area.bottom)
+          return `"${o.rec.id}" lies between them`;
+      }
+      return null;
+    }
+
+    // `transform` as a point-by-point morph of the outlines.
+    setupShape() {
+      const { source, target, t0, t1 } = this.rec;
+      const scene = this.scene, rates = scene.rec.rates, dur = scene.rec.duration;
+      const src = this.src, dst = this.dst;
+      try {
+        // Measure at the exported snapshots (inside the window nothing else
+        // changes either object, so these knots are the right ones).
+        src.apply({ ...this.rec.src, opacity: 1 }, t0 + 1e-6, dur, rates);
+        dst.apply({ ...this.rec.dst, opacity: 1 }, t1 - 1e-6, dur, rates);
+        const parent = src.el.parentNode;
+        if (dst.el.parentNode !== parent) throw new MorphError("different layers");
+        const pctm = parent.getCTM();
+        if (!pctm) throw new MorphError("not measurable");
+        const base = pctm.inverse();
+        const A = shapeLeaves(src, base);
+        const B = shapeLeaves(dst, base);
+        const between = this.between();
+        if (between) throw new MorphError(between);
+        this.buildShape(A, B, parent);
+      } catch (err) {
+        if (!(err instanceof MorphError)) throw err;
+        this.fallback(err.message);
+        if (this.rec.strict)
+          console.warn(`touying: transform("${source}", "${target}") crossfades: ${err.message}`);
+      }
+    }
+
+    buildShape(A, B, parent) {
+      // Pair parts by their place within their object (positions relative
+      // to the object's bounds), so objects far apart still pair sensibly.
+      const frame = (L) => {
+        let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+        for (const l of L) {
+          x0 = Math.min(x0, l.box.x);
+          y0 = Math.min(y0, l.box.y);
+          x1 = Math.max(x1, l.box.x + l.box.w);
+          y1 = Math.max(y1, l.box.y + l.box.h);
+        }
+        const s = Math.max(x1 - x0, y1 - y0, 1e-9);
+        const w = Math.max(x1 - x0, 0.1 * s), h = Math.max(y1 - y0, 0.1 * s);
+        for (const l of L) {
+          l.u = (l.cx - x0) / w;
+          l.v = (l.cy - y0) / h;
+        }
+      };
+      frame(A);
+      frame(B);
+      // Deterministic pairing: reading order, then paint order.
+      const order = (L) =>
+        L.map((_, i) => i).sort((i, j) => L[i].v - L[j].v || L[i].u - L[j].u || i - j);
+      const oa = order(A), ob = order(B);
+      const matched = assign(
+        oa.map((i) => A[i]),
+        ob.map((j) => B[j]),
+        (a, b) => Math.hypot(a.u - b.u, a.v - b.v),
+        1
+      );
+      const partnerA = new Map(), partnerB = new Map();
+      for (const [x, y] of matched) {
+        partnerA.set(oa[x], ob[y]);
+        partnerB.set(ob[y], oa[x]);
+      }
+      // One fixed overlay order, merging both paintings: source order, with
+      // target-only parts inserted after their predecessor in target order.
+      const items = A.map((a, i) => ({ a, b: partnerA.has(i) ? B[partnerA.get(i)] : null, tb: partnerA.get(i) }));
+      const itemOfB = new Map();
+      items.forEach((it) => it.tb !== undefined && itemOfB.set(it.tb, it));
+      let last = null;
+      B.forEach((b, j) => {
+        if (itemOfB.has(j)) {
+          last = itemOfB.get(j);
+          return;
+        }
+        const it = { a: null, b, tb: j };
+        items.splice(last ? items.indexOf(last) + 1 : 0, 0, it);
+        last = it;
+      });
+      // Parts that overlap must keep their stacking order, unless the order
+      // cannot show: all of them opaque and painted alike (e.g. the glyphs of
+      // an equation, whose boxes often touch).
+      const paired = items.filter((it) => it.a && it.b);
+      const paintKey = (l) => {
+        const p = l.paint;
+        const opaque = p.fillOpacity >= 1 - 1e-9 && p.strokeOpacity >= 1 - 1e-9 && p.opacity >= 1 - 1e-9;
+        return opaque ? `${p.fill}|${p.stroke}|${p.stroked ? p.strokeWidth * l.scale : 0}` : null;
+      };
+      const alike = (p, q) => {
+        const k = paintKey(p.a);
+        return k !== null && [p.b, q.a, q.b].every((l) => paintKey(l) === k);
+      };
+      for (let x = 0; x < paired.length; x++)
+        for (let y = x + 1; y < paired.length; y++) {
+          const p = paired[x], q = paired[y];
+          if (p.tb < q.tb || alike(p, q)) continue;
+          if (boxesOverlap(p.a.box, q.a.box) || boxesOverlap(p.b.box, q.b.box))
+            throw new MorphError("overlapping parts change their stacking order");
+        }
+
+      const doc = parent.ownerDocument;
+      const overlay = doc.createElementNS(SVGNS, "g");
+      overlay.setAttribute("data-tys-morph", `${this.rec.source}->${this.rec.target}`);
+      overlay.style.display = "none";
+      parent.insertBefore(overlay, this.src.el.nextSibling);
+      this.overlay = overlay;
+      const tiers = { morph: 0, grow: 0, shrink: 0, fade: 0 };
+      let curves = 0;
+      const clone = (leaf) => {
+        const c = leaf.el.cloneNode(true);
+        c.removeAttribute("transform");
+        if (c.localName === "use") {
+          c.removeAttribute("x");
+          c.removeAttribute("y");
+        }
+        c.removeAttribute("data-typst-label");
+        c.setAttribute("transform", matrixString(leaf.cloneM));
+        overlay.appendChild(c);
+        return c;
+      };
+      const rgb = (c) => `rgb(${Math.round(c[0])},${Math.round(c[1])},${Math.round(c[2])})`;
+      for (const { a, b } of items) {
+        const fade = () => {
+          tiers.fade++;
+          const ca = a && clone(a), cb = b && clone(b);
+          this.items.push((f) => {
+            if (ca) ca.setAttribute("opacity", num(1 - f));
+            if (cb) cb.setAttribute("opacity", num(f));
+          });
+        };
+        if ((a && !a.paint.simple) || (b && !b.paint.simple) || (a && b && !compatible(a, b))) {
+          fade();
+          continue;
+        }
+        const contours = alignContours(a, b);
+        if (!contours) {
+          fade(); // open versus closed outlines
+          continue;
+        }
+        for (const [ca] of contours) curves += ca.segs.length;
+        if (curves > SHAPE_BUDGET.curves) throw new MorphError("too many curves");
+        tiers[a && b ? "morph" : a ? "shrink" : "grow"]++;
+        const sa = styleOf(a, b, !a), sb = styleOf(b, a, !b);
+        const p = (a || b).paint;
+        const stroked = a && a.paint.stroked ? a.paint : b && b.paint.stroked ? b.paint : p;
+        const path = doc.createElementNS(SVGNS, "path");
+        path.setAttribute("fill-rule", p.fillRule);
+        path.setAttribute("stroke-linecap", stroked.linecap);
+        path.setAttribute("stroke-linejoin", stroked.linejoin);
+        path.setAttribute("stroke-miterlimit", stroked.miterlimit);
+        overlay.appendChild(path);
+        const l = (x, y, f) => x + (y - x) * f;
+        const mix = (x, y, f) => [0, 1, 2].map((k) => l(x[k], y[k], f));
+        this.items.push((f) => {
+          path.setAttribute("d", pathData(contours, f));
+          path.setAttribute("fill", rgb(mix(sa.fill, sb.fill, f)));
+          path.setAttribute("fill-opacity", num(l(sa.fa, sb.fa, f)));
+          path.setAttribute("stroke", rgb(mix(sa.stroke, sb.stroke, f)));
+          path.setAttribute("stroke-opacity", num(l(sa.sa, sb.sa, f)));
+          path.setAttribute("stroke-width", num(l(sa.width, sb.width, f)));
+        });
+      }
+      this.mode = "shape";
+      this.info.mode = "shape";
+      this.info.reason = null;
+      this.info.tiers = tiers;
+      this.info.pairs = items
+        .filter((it) => it.a && it.b)
+        .map((it) => ({ from: [num(it.a.cx), num(it.a.cy)], to: [num(it.b.cx), num(it.b.cy)] }));
+    }
+
+    // Remove this morph's overrides (called for every morph before any applies).
+    clear() {
+      const src = this.src, dst = this.dst;
+      if (!src || !dst) return;
+      if (this.overlay) this.overlay.style.display = "none";
+      for (const v of [src, dst]) {
+        v.xf.style.visibility = "";
+        v.xf.style.opacity = "";
+      }
+    }
+
     apply(t) {
       const { t0, t1, ease } = this.rec;
       const src = this.src, dst = this.dst;
       if (!src || !dst) return;
       const inside = t1 > t0 && t >= t0 - 1e-9 && t < t1 - 1e-9;
-      const f = inside ? easeEval(this.scene.rec.rates[ease], (t - t0) / (t1 - t0)) : 0;
-      if (this.mode === "overlay") {
-        this.overlay.style.display = inside ? "" : "none";
-        src.xf.style.visibility = inside ? "hidden" : "";
-        dst.xf.style.visibility = inside ? "hidden" : "";
-        if (inside) for (const item of this.items) item(f);
-      } else {
-        // Inline opacity overrides the state's opacity attribute meanwhile.
-        src.xf.style.opacity = inside ? num(1 - f) : "";
-        dst.xf.style.opacity = inside ? num(f) : "";
+      if (!inside) return; // inactive morphs write nothing
+      const f = easeEval(this.scene.rec.rates[ease], (t - t0) / (t1 - t0));
+      if (this.overlay && (this.mode === "overlay" || this.mode === "shape")) {
+        this.overlay.style.display = "";
+        src.xf.style.visibility = "hidden";
+        dst.xf.style.visibility = "hidden";
+        for (const item of this.items) item(f);
+      } else if (this.rec.kind !== "shape") {
+        // Matching morph fallback: inline opacity overrides the tracks'
+        // opacity meanwhile. A shape morph that falls back writes nothing:
+        // its transform tracks animate the crossfade on their own.
+        src.xf.style.opacity = num(1 - f);
+        dst.xf.style.opacity = num(f);
       }
     }
   }
@@ -1427,7 +2061,12 @@
       if (this.notes) this.notes.textContent = this.payload.notes[i] || "";
       if (this.counter) this.counter.textContent = `${i + 1} / ${this.count}`;
       if (this.presenter) this.presenter.update();
-      if (history.replaceState) history.replaceState(null, "", `#${i + 1}`);
+      try {
+        if (history.replaceState) history.replaceState(null, "", `#${i + 1}`);
+      } catch (_) {
+        // WebKit throttles replaceState (100 calls per 10 s): the page
+        // number in the URL is a convenience, never worth an error.
+      }
     }
 
     applyAll(t) {
@@ -1962,6 +2601,7 @@
         command: (cmd) => player.command(cmd),
         states: (t) => player.scenes.map((s) => ({ key: s.rec.scene.key, states: s.states(t) })),
         morphs: () => player.scenes.flatMap((s) => s.morphs.map((m) => m.info)),
+        shapes: { parsePath, alignContours, splitTo, pathData },
         drag: (key) => DRAG.get(key) || null,
         kernel: { makeView, toCamera, toScreen, drawables, matRotation, matMul, matApply, stepsMatrix },
         world: () =>
