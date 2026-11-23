@@ -109,3 +109,30 @@ def test_uncompressed_build_inlines_the_player():
     assert "class Player" in html
     html, _ = build_html([page('<use xlink:href="#gAAA"/>', GLYPH)])
     assert "tys-player-code" in html and "class Player" not in html
+
+
+def test_tracked_samples_per_second_overrides_the_config(touying_root, tmp_path):
+    typst = pytest.importorskip("typst")
+
+    deck = tmp_path / "fps.typ"
+    deck.write_text(
+        f'#import "{touying_root.as_posix()}/lib.typ": *\n'
+        "#import themes.simple: *\n"
+        "#show: simple-theme.with(config-scene(samples-per-second: 6))\n"
+        "#let sc = touying-scene\n== S\n"
+        "#sc.scene(width: 10cm, height: 4cm,\n"
+        "  objects: (\n"
+        "    a: sc.tracked(x: 0, v => sc.obj($#calc.round(v.x, digits: 2)$)),\n"
+        "    b: sc.tracked(x: 0, samples-per-second: 30, v => sc.obj($#calc.round(v.x, digits: 2)$)),\n"
+        "  ),\n"
+        '  timeline: (sc.play(sc.set-value("a", x: 1), sc.set-value("b", x: 1), run-time: 2, rate: "linear"),),\n'
+        ")\n"
+    )
+    compiler = typst.Compiler(str(deck), root="/", sys_inputs={"touying-scene": "html"})
+    svg = compiler.compile(format="svg")
+    svg = (svg[0] if isinstance(svg, list) else svg).decode()
+    _, records = extract_scene_records(svg)
+    knots = {o["id"]: o["knots"] for o in records[0]["objects"]}
+    # 2 s at 6 and 30 samples per second (both ends included).
+    assert len(knots["a"]["labels"]) == 13
+    assert len(knots["b"]["labels"]) == 61
