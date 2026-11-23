@@ -288,10 +288,26 @@ def test_drag_to_rotate(browser, export, scene_deck):
     page.wait_for_timeout(500)
     assert page.evaluate(f"touying.drag('{key}')") is None
     assert page.evaluate("touying.page") == 0
-    # Navigation resets instantly.
+    # A page change that keeps the scene turns back smoothly (about 1 s).
     drag(page, 50, 0)
+    before = page.evaluate(f"touying.drag('{key}').dtheta")
+    assert before != 0
     page.evaluate("touying.next(); touying.player.finish()")
+    assert page.evaluate("touying.page") == 1
+    assert page.evaluate("touying.player.scenes[0].rec.scene.key") == key
+    page.wait_for_timeout(400)
+    mid = page.evaluate(f"touying.drag('{key}')")
+    assert mid is not None and 0 < abs(mid["dtheta"]) < abs(before), (before, mid)
+    page.wait_for_timeout(900)
     assert page.evaluate(f"touying.drag('{key}')") is None
+    # Grabbing the scene during the ease stops it where it is.
+    drag(page, 50, 0)
+    page.evaluate("touying.prev()")
+    page.wait_for_timeout(200)
+    drag(page, 10, 0)
+    held = page.evaluate(f"touying.drag('{key}').dtheta")
+    page.wait_for_timeout(1100)
+    assert page.evaluate(f"touying.drag('{key}').dtheta") == held
     assert page.errors == []
     page.close()
 

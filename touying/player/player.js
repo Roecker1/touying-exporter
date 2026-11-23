@@ -685,6 +685,8 @@
 
   // Drag offsets per scene key, shared by every stage (audience, presenter).
   const DRAG = new Map();
+  // How long a dragged view takes to turn back after a page change.
+  const NAV_RESET_MS = 1000;
 
   // The 3D layer of one scene on one stage.
   class World3D {
@@ -1398,11 +1400,15 @@
     show(i, mode = "end") {
       this.stop();
       i = clamp(i, 0, this.count - 1);
-      // Looking around with the mouse is per page: reset instantly.
+      // Looking around with the mouse is per page. A scene that continues on
+      // the new page turns back to its script smoothly; others are dropped.
+      const dragged = new Map(DRAG);
       DRAG.clear();
       this.dragEase = null;
       this.page = i;
       for (const stage of this.liveStages()) stage.render(this, i);
+      for (const sc of this.audience.scenes)
+        if (sc.world && dragged.has(sc.rec.scene.key)) DRAG.set(sc.rec.scene.key, dragged.get(sc.rec.scene.key));
       if (this.presenter) this.presenter.renderNext();
       for (const stage of this.liveStages())
         stage.root.style.touchAction = stage.scenes.some((sc) => sc.world) ? "none" : "";
@@ -1417,6 +1423,7 @@
       } else {
         this.applyAll(Infinity);
       }
+      if (DRAG.size) this.resetView(NAV_RESET_MS);
       if (this.notes) this.notes.textContent = this.payload.notes[i] || "";
       if (this.counter) this.counter.textContent = `${i + 1} / ${this.count}`;
       if (this.presenter) this.presenter.update();
@@ -1553,6 +1560,7 @@
     // anything, e.g. 350°, and never jumps).
     nudge(sc, dphi, dtheta, zoom) {
       const key = sc.rec.scene.key;
+      this.dragEase = null; // grabbing the scene stops an ease back
       const off = DRAG.get(key) || { dphi: 0, dtheta: 0, zoom: 1 };
       const phi = evalObject(sc.rec.camera, sc.rec.rates, sc.world.time).phi;
       const m = ((phi % 360) + 360) % 360;
@@ -1566,8 +1574,8 @@
       this.redraw3d(key);
     }
 
-    // `0`: ease the offsets of this page back to the script.
-    resetView() {
+    // `0` (and a page change): ease the offsets back to the script.
+    resetView(ms = 300) {
       if (!DRAG.size) return;
       const from = new Map([...DRAG].map(([k, v]) => [k, { ...v }]));
       const done = () => {
@@ -1581,7 +1589,7 @@
       const start = performance.now();
       const frame = () => {
         if (this.dragEase !== ticket) return;
-        const f = Math.min(1, (performance.now() - start) / 300);
+        const f = Math.min(1, (performance.now() - start) / ms);
         if (f >= 1) return done();
         const k = 1 - (f * f * (3 - 2 * f));
         for (const [key, v] of from)
