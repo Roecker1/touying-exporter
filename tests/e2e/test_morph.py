@@ -74,10 +74,10 @@ def test_factor_pairs_and_continuity(deck):
     at(deck, 2, 0.0001)
     after_start = shot(deck)
     deck.evaluate("touying.goto(2, 'start')")
-    deck.evaluate("touying.player.scenes[0].morphs[0].apply(-1)")  # overlay off, source shown
-    deck.evaluate("touying.player.scenes[0].object('src').xf.style.visibility = ''")
-    _, big = diff(after_start, after_start)
-    assert big == 0
+    deck.evaluate("touying.player.scenes[0].morphs[0].clear()")  # overlay off, source shown
+    source = shot(deck)
+    _, big = diff(after_start, source)
+    assert big < 0.002, big
 
 
 def test_repeated_glyphs_pair_the_nearest(deck):
