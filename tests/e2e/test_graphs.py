@@ -141,6 +141,10 @@ def test_interpolation_accuracy(deck):
     [
         ('<path d="M 0 0c 1 0 2 0 3 0"/>', '<path transform="translate(4)" d="M 0 0c 1 1 2 2 3 3"/>', True),
         ('<path transform="translate(4 5)" d="M 0 0c 0 0 0 0 0 0"/>', '<path d="M 0 0c 1 1 2 2 3 3"/>', True),
+        # Glyphs move by the translation of their matrix (labels of a secant).
+        ('<g transform="matrix(1 0 0 -1 232.9 205.3)"/>', '<g transform="matrix(1 0 0 -1 231 207.1)"/>', True),
+        # A different linear part (rotation or scale) stays in the skeleton.
+        ('<g transform="matrix(1 0 0 -1 2 3)"/>', '<g transform="matrix(0.5 0 0 -0.5 2 3)"/>', False),
         # A clip that changes the segment count changes the skeleton.
         ('<path d="M 0 0c 1 0 2 0 3 0"/>', '<path d="M 0 0c 1 0 2 0 3 0c 1 0 2 0 3 0"/>', False),
     ],

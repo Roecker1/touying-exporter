@@ -136,6 +136,12 @@ _NUM = r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?"
 _NUM_RE = re.compile(_NUM)
 _FULL_NUM_RE = re.compile(rf"^\s*{_NUM}\s*$")
 _TRANSLATE_RE = re.compile(rf"^translate\(\s*{_NUM}(?:[\s,]+{_NUM})?\s*\)$")
+# matrix(a b c d e f): only the translation (e, f) is interpolated; the
+# linear part stays in the skeleton, so knots blend only when it is equal
+# (Typst places glyphs with matrix(1 0 0 -1 x y)).
+_MATRIX_RE = re.compile(
+    rf"^(matrix\(\s*{_NUM}[\s,]+{_NUM}[\s,]+{_NUM}[\s,]+{_NUM}[\s,]+)({_NUM})([\s,]+)({_NUM})(\s*\))$"
+)
 # Only these attributes carry interpolable numbers; anything else (colours,
 # references, matrices, dash patterns, ...) is part of the skeleton and must
 # match exactly.
@@ -178,6 +184,10 @@ def cut_labelled(svg: str, label: str) -> Tuple[str, str]:
 def _split_numbers(name: str, value: str):
     """(literals, numbers) if the attribute has interpolable numbers."""
     plain = name.split("}")[-1]
+    if plain == "transform":
+        m = _MATRIX_RE.match(value)
+        if m:
+            return [m.group(1), m.group(3), m.group(5)], [float(m.group(2)), float(m.group(4))]
     if plain == "d" and not re.search(r"[aA]", value):
         pass  # arcs carry flags, which must not be interpolated
     elif plain == "transform" and _TRANSLATE_RE.match(value):
